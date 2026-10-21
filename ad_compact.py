@@ -30,7 +30,7 @@ try:
 except ImportError:
     carla = None
 
-LOG_FILE = "adas_log.csv"
+LOG_FILE = "adas_log_v2.csv"
 
 # --- Driver monitoring ---
 EAR_THRESHOLD = 0.21            # eyes "closed" below this
@@ -41,18 +41,16 @@ OFF_ROAD_PITCH_DOWN_DEG = 20.0  # head tilted down further than this = off road 
 CALIBRATION_FRAMES = 30         # ~1 s of "look straight at the screen"
 GAZE_DEG_PER_UNIT = 100.0       # iris offset (fraction of eye width) -> degrees
 
-# --- Head/eye -> CARLA camera ---
-YAW_GAIN = 2.0                  # 20 deg real head turn -> 40 deg in sim
-PITCH_GAIN = 1.5
-GAZE_VIEW_WEIGHT = 0.3          # how much eye movement nudges the view (0 = head only)
-MAX_VIEW_YAW = 120.0
-MAX_VIEW_PITCH = 50.0
-VIEW_SMOOTHING = 0.35           # 0..1, higher = snappier, lower = smoother
-EYE_X, EYE_Y, EYE_Z = 0.30, -0.35, 1.42   # driver's eye in car frame (x fwd, y right, z up)
-HEAD_STEER_DEADZONE = 4.0       # degrees from calibrated neutral
-HEAD_STEER_FULL = 25.0          # degrees for full steering input
-HEAD_PEDAL_DEADZONE = 8.0       # pitch degrees before throttle/brake responds
-HEAD_PEDAL_FULL = 25.0          # pitch degrees for full pedal input
+# Fixed chase view, in vehicle coordinates (x forward, y right, z up).
+CHASE_X, CHASE_Y, CHASE_Z = -6.0, 0.0, 3.2
+CHASE_PITCH = -15.0
+HEAD_STEER_DEADZONE = 8.0       # ignore small head movements
+HEAD_STEER_FULL = 40.0
+HEAD_MAX_STEER = 0.45
+HEAD_STEER_RATE = 0.6           # maximum steering change per second
+HEAD_THROTTLE_RATE = 0.35
+HEAD_PEDAL_DEADZONE = 12.0       # pitch degrees before throttle/brake responds
+HEAD_PEDAL_FULL = 35.0          # pitch degrees for full pedal input
 
 # --- Simulation ---
 NUM_NPC = 15
@@ -277,25 +275,64 @@ def brake_level(decision, state, auto):
 
 def head_controls(snap):
     """Return throttle, steering and brake; missing tracking commands a stop."""
-    if not snap["face"] or not snap["calibrated"]:
+    if not snap["face"] or not snap["calibrated"] or snap.get("state") in {"drowsy", "unavailable"}:
         return 0.0, 0.0, 0.8
     yaw, pitch = snap["yaw"], snap["pitch"]
     steer = math.copysign(min(1.0, max(0.0, abs(yaw) - HEAD_STEER_DEADZONE) /
                              (HEAD_STEER_FULL - HEAD_STEER_DEADZONE)), yaw)
     pedal = min(1.0, max(0.0, abs(pitch) - HEAD_PEDAL_DEADZONE) /
                 (HEAD_PEDAL_FULL - HEAD_PEDAL_DEADZONE))
-    return (0.6 * pedal if pitch > 0 else 0.0), steer, (0.8 * pedal if pitch < 0 else 0.0)
+    return (0.4 * pedal if pitch > 0 else 0.0), HEAD_MAX_STEER * steer, (0.8 * pedal if pitch < 0 else 0.0)
 
-def log_scenario(speed, distance, obstacle, road, driver_state, ttc, risk, decision):
-    new = not os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        w = csv.writer(f)
+class HeadController:
+    """Limit changes in steering/throttle; braking always takes effect immediately."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.throttle = self.steer = 0.0
+        self.updated = time.monotonic()
+
+    def update(self, snap):
+        throttle, steer, brake = head_controls(snap)
+        now = time.monotonic()
+        dt = max(0.0, min(now - self.updated, 0.1))
+        self.updated = now
+        if not snap["face"] or not snap["calibrated"] or snap.get("state") in {"drowsy", "unavailable"}:
+            self.reset()
+            return 0.0, 0.0, brake
+        def approach(current, target, rate):
+            return current + max(-rate * dt, min(rate * dt, target - current))
+        self.steer = approach(self.steer, steer, HEAD_STEER_RATE)
+        self.throttle = 0.0 if brake else approach(self.throttle, throttle, HEAD_THROTTLE_RATE)
+        return self.throttle, self.steer, brake
+
+
+def control_action(state, mode, controls):
+    if mode == "EVALUATION_ONLY":
+        return "EVALUATION ONLY"
+    if controls is None:
+        return "AUTOPILOT"
+    if controls[2] > 0:
+        return {"drowsy": "DROWSY STOP", "unavailable": "TRACKING LOST STOP"}.get(state, "BRAKE")
+    return "DRIVER ALERT" if state == "distracted" else "DRIVE"
+
+
+def log_scenario(sample, mode, controls, action):
+    """Log commanded controls, not measured actuator response."""
+    speed, distance, obstacle, road, state, ttc, risk, decision = sample
+    new = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         if new:
-            w.writerow(["time", "speed_kmh", "distance_m", "obstacle", "road",
-                        "driver_state", "ttc_s", "risk", "decision"])
-        w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    round(speed, 1), round(distance, 1), obstacle, road,
-                    driver_state, ttc, risk, decision])
+            writer.writerow(["time", "speed_kmh", "distance_m", "obstacle", "road",
+                             "driver_state", "ttc_s", "risk", "risk_decision", "mode",
+                             "control_action", "commanded_throttle", "commanded_steer", "commanded_brake"])
+        writer.writerow([datetime.now().isoformat(timespec="milliseconds"), round(speed, 1),
+                         round(distance, 1) if math.isfinite(distance) else "NO_LEAD_IN_RANGE",
+                         obstacle if math.isfinite(distance) else "None detected", road, state, round(ttc, 2) if math.isfinite(ttc) else "N/A",
+                         risk, decision, mode, action,
+                         *(tuple(round(v, 3) for v in controls) if controls is not None else ("", "", ""))])
 
 def listen_once():
     r = sr.Recognizer()
@@ -346,6 +383,7 @@ class CarlaIntegration:
         self._road_frame = None
         self._lock = threading.Lock()
         self._brake_until = 0.0
+        self._held_brake = 0.0
         self._lead_cache = (0.0, math.inf)
 
         if carla is None:
@@ -410,20 +448,17 @@ class CarlaIntegration:
         with self._lock:
             return None if self._road_frame is None else self._road_frame.copy()
 
-    def update_view(self, yaw_off, pitch_off):
-        """Put the spectator at the driver's eyes and rotate it with the driver's head."""
+    def update_view(self):
+        """Keep the spectator above/behind the trunk; head motion never rotates it."""
         if not self.vehicle:
             return
         tf = self.vehicle.get_transform()
         f, r, u = tf.get_forward_vector(), tf.get_right_vector(), tf.get_up_vector()
         loc = tf.location
-        eye = carla.Location(
-            x=loc.x + f.x * EYE_X + r.x * EYE_Y + u.x * EYE_Z,
-            y=loc.y + f.y * EYE_X + r.y * EYE_Y + u.y * EYE_Z,
-            z=loc.z + f.z * EYE_X + r.z * EYE_Y + u.z * EYE_Z)
-        rot = carla.Rotation(pitch=tf.rotation.pitch + pitch_off,
-                             yaw=tf.rotation.yaw + yaw_off,
-                             roll=tf.rotation.roll)
+        eye = carla.Location(x=loc.x + f.x * CHASE_X + r.x * CHASE_Y + u.x * CHASE_Z,
+                             y=loc.y + f.y * CHASE_X + r.y * CHASE_Y + u.y * CHASE_Z,
+                             z=loc.z + f.z * CHASE_X + r.z * CHASE_Y + u.z * CHASE_Z)
+        rot = carla.Rotation(pitch=tf.rotation.pitch + CHASE_PITCH, yaw=tf.rotation.yaw)
         self.spectator.set_transform(carla.Transform(eye, rot))
 
     def set_autopilot(self, enabled):
@@ -480,9 +515,11 @@ class CarlaIntegration:
             self.set_autopilot(False)    # Traffic Manager would overwrite our control
             self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=level))
             self._brake_until = now + BRAKE_HOLD_S
+            self._held_brake = level
         elif not self.autopilot and now > self._brake_until:
             self.vehicle.apply_control(carla.VehicleControl(brake=0.0))
             self.set_autopilot(True)
+        return None if self.autopilot else (0.0, 0.0, self._held_brake)
 
     def cleanup(self):
         for actor in ([self.camera] if self.camera else []) + self.npcs + ([self.vehicle] if self.vehicle else []):
@@ -531,8 +568,9 @@ class ADASApp(wx.Frame):
             except Exception as e:
                 print(f"YOLO disabled: {e}")
 
-        self.view_yaw = 0.0
-        self.view_pitch = 0.0
+        self.head_controller = HeadController()
+        self._evaluation = None
+        self._last_log = 0.0
         self._last_beep = 0.0
         self._last_key = None
         self._camera_warned = False
@@ -561,7 +599,7 @@ class ADASApp(wx.Frame):
         connected = self.carla_sim.vehicle is not None
         for name, text, value, handler in [
             ("auto_chk", "Use live CARLA speed + lead distance", connected, lambda e: self._apply_auto_state()),
-            ("head_control_chk", "Drive with head movement", connected, self.on_head_control_toggle),
+            ("head_control_chk", "Drive with head movement (enable after calibration)", False, self.on_head_control_toggle),
             ("autopilot_chk", "CARLA autopilot", False, self.on_autopilot_toggle),
         ]:
             widget = add(wx.CheckBox(panel, label=text))
@@ -590,6 +628,7 @@ class ADASApp(wx.Frame):
         for name, text in [("ttc_output", "TTC: --"), ("risk_output", "Risk: --"),
                            ("decision_output", "Decision: --")]:
             setattr(self, name, label(text))
+        self.control_output = label("Control: --")
         self.voice_btn = button("Voice Command", self.on_voice_input)
         panel.SetSizer(layout)
         self._apply_auto_state()
@@ -609,12 +648,14 @@ class ADASApp(wx.Frame):
         self.distance_input.Enable(manual)
 
     def on_autopilot_toggle(self, _event):
+        self.head_controller.reset()
         enabled = self.autopilot_chk.GetValue()
         if enabled:
             self.head_control_chk.SetValue(False)
         self.carla_sim.set_autopilot(enabled)
 
     def on_head_control_toggle(self, _event):
+        self.head_controller.reset()
         if self.head_control_chk.GetValue():
             self.autopilot_chk.SetValue(False)
             self.carla_sim.set_autopilot(False)
@@ -628,6 +669,8 @@ class ADASApp(wx.Frame):
             return bool(wx.GetKeyState(vk_code))
 
     def _manual_keys(self):
+        if isinstance(wx.Window.FindFocus(), wx.TextCtrl):
+            return 0.0, 0.0, 0.0
         forward = self._key_down(ord("W")) or self._key_down(wx.WXK_UP)  # W / Up
         back = self._key_down(ord("S")) or self._key_down(wx.WXK_DOWN)     # S / Down
         left = self._key_down(ord("A")) or self._key_down(wx.WXK_LEFT)     # A / Left
@@ -664,26 +707,26 @@ class ADASApp(wx.Frame):
             snap = self.tracker.snapshot()
         state = snap["state"]
 
-        if snap["face"] and snap["calibrated"]:
-            ty = max(-MAX_VIEW_YAW, min(MAX_VIEW_YAW,
-                     snap["yaw"] * YAW_GAIN + snap["gaze_yaw"] * GAZE_VIEW_WEIGHT))
-            tp = max(-MAX_VIEW_PITCH, min(MAX_VIEW_PITCH, snap["pitch"] * PITCH_GAIN))
-            self.view_yaw += VIEW_SMOOTHING * (ty - self.view_yaw)
-            self.view_pitch += VIEW_SMOOTHING * (tp - self.view_pitch)
-        # (face lost -> hold last view instead of snapping)
-        self.carla_sim.update_view(self.view_yaw, self.view_pitch)
+        self.carla_sim.update_view()
 
         decision = self.evaluate(state)
 
         adas_brake = brake_level(decision, state, self._is_auto())
         if self.autopilot_chk.GetValue():
-            self.carla_sim.set_brake(adas_brake)
+            mode = "AUTOPILOT"
+            controls = self.carla_sim.set_brake(adas_brake)
         else:
-            if self.head_control_chk.GetValue():
-                throttle, steer, brake = head_controls(snap)
+            mode = "HEAD" if self.head_control_chk.GetValue() else "KEYBOARD"
+            if mode == "HEAD":
+                throttle, steer, brake = self.head_controller.update(snap)
             else:
                 throttle, steer, brake = self._manual_keys()
-            self.carla_sim.apply_manual_control(throttle, steer, max(brake, adas_brake))
+            brake = max(brake, adas_brake)
+            controls = (0.0 if brake > 0 else throttle), steer, brake
+            self.carla_sim.apply_manual_control(*controls)
+        if self.carla_sim.vehicle is None:
+            mode, controls = "EVALUATION_ONLY", None
+        self.record_controls(mode, controls)
         now = time.time()
         alert = {"drowsy": (1.0, 1000, 300), "distracted": (2.0, 600, 200)}.get(state)
         if alert and now - self._last_beep > alert[0]:
@@ -716,21 +759,34 @@ class ADASApp(wx.Frame):
     def evaluate(self, state, force_log=False):
         inputs = self._read_inputs()
         if inputs is None:
+            self._evaluation = None
             self._set(self.decision_output, "Decision: invalid input")
             return None
         speed, distance = inputs
         obstacle = self.obstacle_choice.GetStringSelection()
         road = self.road_choice.GetStringSelection()
         ttc, risk, decision = evaluate_adas(speed, distance, obstacle, road, state)
-        for control, text in [(self.ttc_output, f"TTC: {ttc} seconds"),
+        for control, text in [(self.ttc_output, f"TTC: {ttc} seconds" if math.isfinite(ttc) else "TTC: N/A (stopped or no lead)"),
                               (self.risk_output, f"Risk Score: {risk}"),
                               (self.decision_output, f"Decision: {decision}")]:
             self._set(control, text)
-        key = decision, state
-        if force_log or key != self._last_key:
-            self._last_key = key
-            log_scenario(speed, distance, obstacle, road, state, ttc, risk, decision)
+        self._evaluation = (speed, distance, obstacle, road, state, ttc, risk, decision)
+        if force_log:
+            self.record_controls("EVALUATION_ONLY", None, force=True)
         return decision
+
+    def record_controls(self, mode, controls, force=False):
+        if self._evaluation is None:
+            return
+        state, decision = self._evaluation[4], self._evaluation[7]
+        action = control_action(state, mode, controls)
+        self._set(self.control_output, f"Control: {action}" +
+                  (f" | brake {controls[2]:.0%}" if controls is not None else ""))
+        key = state, decision, mode, action
+        now = time.monotonic()
+        if force or key != self._last_key or now - self._last_log >= 1.0:
+            log_scenario(self._evaluation, mode, controls, action)
+            self._last_key, self._last_log = key, now
 
     def on_evaluate(self, _event):
         if self.evaluate(self.tracker.snapshot()["state"], force_log=True) is None:

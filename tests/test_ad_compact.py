@@ -1,5 +1,7 @@
 """Regression checks using synthetic camera/CARLA dependencies, no hardware needed."""
 import ast
+import csv
+import tempfile
 import importlib.util
 import math
 from pathlib import Path
@@ -75,9 +77,9 @@ class CompactTests(unittest.TestCase):
                 self.app.evaluate_adas(speed, distance, 'Vehicle', 'Dry', 'normal')
 
     def test_head_controls_and_tracking_loss(self):
-        snap = dict(face=True, calibrated=True, yaw=25, pitch=25)
-        self.assertEqual(self.app.head_controls(snap), (0.6, 1.0, 0))
-        self.assertEqual(self.app.head_controls(dict(snap, yaw=-25, pitch=-25)), (0, -1, 0.8))
+        snap = dict(face=True, calibrated=True, yaw=40, pitch=35)
+        self.assertEqual(self.app.head_controls(snap), (0.4, 0.45, 0))
+        self.assertEqual(self.app.head_controls(dict(snap, yaw=-40, pitch=-35)), (0, -0.45, 0.8))
         self.assertEqual(self.app.head_controls(dict(snap, face=False)), (0, 0, 0.8))
         self.assertEqual(self.app.head_controls(dict(snap, calibrated=False)), (0, 0, 0.8))
         self.assertEqual(self.app.brake_level('MONITOR', 'unavailable', True), 0.8)
@@ -165,11 +167,14 @@ class CompactTests(unittest.TestCase):
         gui.obstacle_choice.GetStringSelection.return_value = 'Vehicle'
         gui.road_choice.GetStringSelection.return_value = 'Dry'
         gui.ttc_output, gui.risk_output, gui.decision_output = Mock(), Mock(), Mock()
-        gui._last_key = None
+        gui._last_key, gui._last_log = None, 0.0
+        gui.control_output = Mock()
         with patch.object(self.app, 'log_scenario') as log:
             expected = self.app.evaluate_adas(80, 20, 'Vehicle', 'Dry', 'normal')[2]
             self.assertEqual(gui.evaluate('normal'), expected)
+            gui.record_controls('HEAD', (0.1, 0.0, 0.0))
             gui.evaluate('normal')
+            gui.record_controls('HEAD', (0.1, 0.0, 0.0))
             self.assertEqual(log.call_count, 1)
             gui.evaluate('normal', force_log=True)
             self.assertEqual(log.call_count, 2)
@@ -212,6 +217,96 @@ class CompactTests(unittest.TestCase):
             gui.on_close(None)
             tracker.stop.assert_called_once()
             sim.cleanup.assert_called_once()
+            sim.vehicle = Mock()
+            with patch.object(self.app, 'ENABLE_YOLO', False):
+                connected_gui = self.app.ADASApp()
+            self.assertFalse(connected_gui.head_control_chk.GetValue())
+
+    def test_chase_camera_is_above_and_behind_trunk(self):
+        sim = self.simulator()
+        sim.spectator = Mock()
+        # Car faces world +Y: backward offset must rotate with the vehicle.
+        tf = NS(location=NS(x=10, y=20, z=1), rotation=NS(pitch=0, yaw=90),
+                get_forward_vector=lambda: NS(x=0, y=1, z=0),
+                get_right_vector=lambda: NS(x=-1, y=0, z=0),
+                get_up_vector=lambda: NS(x=0, y=0, z=1))
+        sim.vehicle.get_transform = lambda: tf
+        self.app.carla.Location.side_effect = lambda **kw: NS(**kw)
+        self.app.carla.Rotation.side_effect = lambda **kw: NS(**kw)
+        self.app.carla.Transform.side_effect = lambda loc, rot: NS(location=loc, rotation=rot)
+        sim.update_view()
+        view = sim.spectator.set_transform.call_args.args[0]
+        self.assertEqual((view.location.x, view.location.y, view.location.z), (10, 14, 4.2))
+        self.assertEqual((view.rotation.pitch, view.rotation.yaw), (-15, 90))
+
+    def test_head_deadzone_and_slew_limit(self):
+        snap = dict(state='normal', face=True, calibrated=True, yaw=7, pitch=11)
+        self.assertEqual(self.app.head_controls(snap), (0, 0, 0))
+        clock = NS(now=0.0)
+        with patch.object(self.app, 'time', NS(monotonic=lambda: clock.now)):
+            controller = self.app.HeadController()
+            clock.now = 0.05
+            target = dict(snap, yaw=40, pitch=35)
+            throttle, steer, brake = controller.update(target)
+            self.assertAlmostEqual(throttle, 0.0175)
+            self.assertAlmostEqual(steer, 0.03)
+            self.assertEqual(brake, 0)
+            clock.now = 10.0  # a paused GUI must not cause a control jump
+            throttle, steer, _ = controller.update(target)
+            self.assertAlmostEqual(throttle, 0.0525)
+            self.assertAlmostEqual(steer, 0.09)
+            clock.now += 0.05
+            self.assertEqual(controller.update(dict(target, face=False)), (0, 0, 0.8))
+
+    def test_drowsy_control_stops_without_acceleration(self):
+        snap = dict(state='drowsy', face=True, calibrated=True, yaw=40, pitch=35)
+        self.assertEqual(self.app.head_controls(snap), (0, 0, 0.8))
+        self.assertEqual(self.app.control_action('drowsy', 'HEAD', (0, 0, 0.8)), 'DROWSY STOP')
+        self.assertEqual(self.app.control_action('distracted', 'HEAD', (0, 0, 0)), 'DRIVER ALERT')
+
+    def test_csv_reports_real_control_command_and_clear_road(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'log.csv'
+            self.app.LOG_FILE = str(path)
+            sample = (13.1, math.inf, 'Vehicle', 'Dry', 'drowsy', math.inf, 7, 'MONITOR')
+            self.app.log_scenario(sample, 'HEAD', (0, 0, 0.8), 'DROWSY STOP')
+            self.app.log_scenario(sample, 'EVALUATION_ONLY', None, 'EVALUATION ONLY')
+            with path.open(newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[0]['risk_decision'], 'MONITOR')
+            self.assertEqual(rows[0]['control_action'], 'DROWSY STOP')
+            self.assertEqual(rows[0]['commanded_brake'], '0.8')
+            self.assertEqual(rows[0]['distance_m'], 'NO_LEAD_IN_RANGE')
+            self.assertEqual(rows[0]['ttc_s'], 'N/A')
+            self.assertEqual(rows[0]['obstacle'], 'None detected')
+            self.assertEqual(rows[1]['commanded_brake'], '')
+            self.assertEqual(len(rows), 2)
+
+    def test_csv_records_periodic_telemetry(self):
+        gui = self.app.ADASApp.__new__(self.app.ADASApp)
+        gui._evaluation = (20, 15, 'Vehicle', 'Dry', 'normal', 2.7, 2.06, 'MONITOR')
+        gui.control_output = Mock()
+        gui._last_key, gui._last_log = None, 0.0
+        clock = NS(now=10.0)
+        with patch.object(self.app, 'time', NS(monotonic=lambda: clock.now)), \
+                patch.object(self.app, 'log_scenario') as log:
+            gui.record_controls('KEYBOARD', (0.2, 0, 0))
+            clock.now = 10.2
+            gui.record_controls('KEYBOARD', (0.3, 0, 0))
+            self.assertEqual(log.call_count, 1)
+            clock.now = 11.0
+            gui.record_controls('KEYBOARD', (0.4, 0, 0))
+            self.assertEqual(log.call_count, 2)
+            self.assertEqual(log.call_args.args[2], (0.4, 0, 0))
+
+    def test_typing_in_text_fields_cannot_steer(self):
+        gui = self.app.ADASApp.__new__(self.app.ADASApp)
+        gui._key_down = Mock(return_value=True)
+        text_type = type('TextCtrl', (), {})
+        fake_wx = NS(TextCtrl=text_type, Window=NS(FindFocus=lambda: text_type()))
+        with patch.object(self.app, 'wx', fake_wx):
+            self.assertEqual(gui._manual_keys(), (0, 0, 0))
+        gui._key_down.assert_not_called()
 
     def test_manual_brake_suppresses_throttle(self):
         sim = self.simulator()
@@ -226,11 +321,11 @@ class CompactTests(unittest.TestCase):
         sim.autopilot = True
         sim.vehicle.apply_control, sim.vehicle.set_autopilot = Mock(), Mock()
         with patch.object(self.app.time, 'time', return_value=100):
-            sim.set_brake(0.8)
-            sim.set_brake(0)
+            self.assertEqual(sim.set_brake(0.8), (0, 0, 0.8))
+            self.assertEqual(sim.set_brake(0), (0, 0, 0.8))
             self.assertFalse(sim.autopilot)
         with patch.object(self.app.time, 'time', return_value=102):
-            sim.set_brake(0)
+            self.assertIsNone(sim.set_brake(0))
             self.assertTrue(sim.autopilot)
 
 

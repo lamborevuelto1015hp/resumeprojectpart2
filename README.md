@@ -34,3 +34,25 @@ python -m unittest discover -s tests -v
 ```
 
 These checks do not replace testing with a real webcam, GUI, and CARLA server.
+
+## Chase camera, gentler driving, and clearer logs
+
+The CARLA spectator now follows 6 m behind the vehicle center and 3.2 m above it,
+looking down 15 degrees over the trunk. Head movement no longer rotates the view.
+The separate YOLO road preview stays on the forward sensor.
+
+Head driving starts **off**. Look straight, press **Re-center head**, wait for
+calibration, then enable **Drive with head movement**. Small turns below 8 degrees
+are ignored; maximum head steering is 45%, reached at 40 degrees. Steering and
+throttle increase gradually, while braking and tracking-loss stops act immediately.
+Tune the `HEAD_*` constants near the top of `ad_compact.py` if needed.
+Typing into text fields suppresses keyboard driving.
+
+New runs write `adas_log_v2.csv`, preserving older `adas_log.csv` files. Rows are
+recorded at least once per second while inputs are valid, plus state/action changes.
+`risk_decision` describes the risk heuristic; `control_action` describes the control
+command (for example, `DROWSY STOP` with `commanded_brake=0.8`). These values are
+commands, not measured proof that the car braked. Autopilot-managed controls and
+`EVALUATION_ONLY` rows leave command values blank. `NO_LEAD_IN_RANGE` means no
+vehicle was found within the 80 m search corridor; TTC is `N/A` when stopped or
+no lead is found. This does not prove the entire road is clear.
