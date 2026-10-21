@@ -168,6 +168,7 @@ class CompactTests(unittest.TestCase):
         gui.road_choice.GetStringSelection.return_value = 'Dry'
         gui.ttc_output, gui.risk_output, gui.decision_output = Mock(), Mock(), Mock()
         gui._last_key, gui._last_log = None, 0.0
+        gui._driver_snap = None
         gui.control_output = Mock()
         with patch.object(self.app, 'log_scenario') as log:
             expected = self.app.evaluate_adas(80, 20, 'Vehicle', 'Dry', 'normal')[2]
@@ -221,6 +222,7 @@ class CompactTests(unittest.TestCase):
             with patch.object(self.app, 'ENABLE_YOLO', False):
                 connected_gui = self.app.ADASApp()
             self.assertFalse(connected_gui.head_control_chk.GetValue())
+            self.assertFalse(connected_gui.straight_chk.GetValue())
 
     def test_chase_camera_is_above_and_behind_trunk(self):
         sim = self.simulator()
@@ -287,6 +289,7 @@ class CompactTests(unittest.TestCase):
         gui._evaluation = (20, 15, 'Vehicle', 'Dry', 'normal', 2.7, 2.06, 'MONITOR')
         gui.control_output = Mock()
         gui._last_key, gui._last_log = None, 0.0
+        gui._driver_snap = None
         clock = NS(now=10.0)
         with patch.object(self.app, 'time', NS(monotonic=lambda: clock.now)), \
                 patch.object(self.app, 'log_scenario') as log:
@@ -307,6 +310,139 @@ class CompactTests(unittest.TestCase):
         with patch.object(self.app, 'wx', fake_wx):
             self.assertEqual(gui._manual_keys(), (0, 0, 0))
         gui._key_down.assert_not_called()
+
+    def test_upward_tilt_does_not_trigger_fixed_ear_false_alarm(self):
+        monitor = self.app.DriverMonitor()
+        # Open-eye EAR drops from 0.30 to 0.20 with a small upward tilt.
+        for now in (0, 1, 2, 3, 5):
+            self.assertEqual(monitor.update(True, True, 0, 8, 0, 0.20, 0.30, now), 'normal')
+        self.assertAlmostEqual(monitor.threshold, 0.18)
+
+    def test_sustained_closed_eyes_still_detected(self):
+        monitor = self.app.DriverMonitor()
+        self.assertEqual(monitor.update(True, True, 0, 0, 0, 0.08, 0.30, 0), 'normal')
+        self.assertEqual(monitor.update(True, True, 0, 0, 0, 0.08, 0.30, 1), 'normal')
+        self.assertEqual(monitor.update(True, True, 0, 0, 0, 0.08, 0.30, 2), 'drowsy')
+        self.assertEqual(monitor.update(True, True, 0, 0, 0, 0.30, 0.30, 2.1), 'normal')
+
+    def test_blink_does_not_accumulate_into_drowsiness(self):
+        monitor = self.app.DriverMonitor()
+        for now, ear in ((0, .08), (.2, .3), (1, .08), (1.2, .3), (2, .08), (2.2, .3)):
+            self.assertEqual(monitor.update(True, True, 0, 0, 0, ear, .3, now), 'normal')
+
+    def test_large_upward_pose_classified_as_distraction(self):
+        monitor = self.app.DriverMonitor()
+        monitor.update(True, True, 0, 30, 0, .1, .3, 0)
+        self.assertEqual(monitor.update(True, True, 0, 30, 0, .1, .3, 3), 'distracted')
+
+    def test_uncalibrated_frames_cannot_trigger_drowsiness(self):
+        monitor = self.app.DriverMonitor()
+        monitor.update(True, False, 0, 0, 0, .08, None, 0)
+        self.assertEqual(monitor.update(True, False, 0, 0, 0, .08, None, 3), 'normal')
+
+    def test_straight_gate_waits_then_stops_and_requires_new_hold(self):
+        snap = dict(state='normal', face=True, calibrated=True, yaw=0, pitch=0, gaze_yaw=0)
+        clock = NS(now=0.0)
+        with patch.object(self.app, 'time', NS(monotonic=lambda: clock.now)):
+            gate = self.app.StraightDriveGate()
+            self.assertFalse(gate.allow(snap))
+            clock.now = .5
+            self.assertFalse(gate.allow(snap))
+            clock.now = .75
+            self.assertTrue(gate.allow(snap))
+            self.assertTrue(gate.allow(dict(snap, yaw=14)))
+            self.assertFalse(gate.allow(dict(snap, yaw=16)))
+            clock.now = 1
+            self.assertFalse(gate.allow(snap))
+            clock.now = 1.75
+            self.assertTrue(gate.allow(snap))
+
+    def test_straight_gate_rejects_pose_gaze_and_tracking_failures(self):
+        snap = dict(state='normal', face=True, calibrated=True, yaw=0, pitch=0, gaze_yaw=0)
+        cases = [dict(snap, face=False), dict(snap, calibrated=False), dict(snap, state='drowsy'),
+                 dict(snap, state='unavailable'), dict(snap, state='distracted'),
+                 dict(snap, yaw=11), dict(snap, pitch=13), dict(snap, gaze_yaw=13),
+                 dict(snap, yaw=math.nan)]
+        for case in cases:
+            gate = self.app.StraightDriveGate()
+            with patch.object(self.app.time, 'monotonic', return_value=0):
+                self.assertFalse(gate.allow(case))
+            with patch.object(self.app.time, 'monotonic', return_value=10):
+                self.assertFalse(gate.allow(case))
+
+    def test_straight_mode_dispatches_autopilot_brakes_on_look_away(self):
+        gui = self.app.ADASApp.__new__(self.app.ADASApp)
+        gui.tracker = Mock(error=None)
+        snap = dict(state='normal', face=True, calibrated=True, yaw=0, pitch=0, gaze_yaw=0)
+        gui.tracker.snapshot.return_value = snap
+        gui.tracker.get_frame.return_value = None
+        gui.carla_sim, gui.straight_chk = Mock(), Mock()
+        gui.straight_chk.GetValue.return_value = True
+        gui.straight_gate = self.app.StraightDriveGate()
+        gui.evaluate = Mock(return_value='MONITOR')
+        gui._is_auto = lambda: True
+        gui.record_controls, gui._set = Mock(), Mock()
+        gui.driver_label, gui.head_label, gui.vision = Mock(), Mock(), None
+        clock = NS(now=0.0)
+        with patch.object(self.app, 'time', NS(monotonic=lambda: clock.now, time=lambda: clock.now)):
+            gui.on_tick(None)
+            gui.carla_sim.set_brake.assert_called_with(.6)
+            clock.now = .75
+            gui.on_tick(None)
+            gui.carla_sim.set_brake.assert_called_with(0)
+            gui.tracker.snapshot.return_value = dict(snap, pitch=20)
+            gui.on_tick(None)
+            gui.carla_sim.set_brake.assert_called_with(.6)
+            gui.tracker.snapshot.return_value = dict(snap, state='drowsy')
+            gui._last_beep = clock.now
+            gui.on_tick(None)
+            gui.carla_sim.set_brake.assert_called_with(.8)
+        gui.carla_sim.apply_manual_control.assert_not_called()
+
+    def test_calibration_collects_eye_baseline(self):
+        tracker = self.app.DriverTracker()
+        cap = Mock()
+        reads = [0]
+        def read():
+            reads[0] += 1
+            if reads[0] == 3:
+                tracker._stop_evt.set()
+            return True, NS(shape=(480, 640, 3))
+        cap.read.side_effect = read
+        self.app.cv2.VideoCapture.return_value = cap
+        landmark = [NS(x=.5, y=.5)] * 478
+        mesh = self.app.mp.solutions.face_mesh.FaceMesh.return_value.__enter__.return_value
+        mesh.process.return_value = NS(multi_face_landmarks=[NS(landmark=landmark)])
+        with patch.object(self.app, 'CALIBRATION_FRAMES', 3), \
+                patch.object(self.app, 'head_pose', return_value=(0, 0)), \
+                patch.object(self.app, 'gaze_offset', return_value=0), \
+                patch.object(self.app, 'eye_aspect_ratio', return_value=.3):
+            tracker.run()
+        self.assertIsNone(tracker.error)
+        self.assertEqual(tracker._neutral, (0, 0, 0, .3))
+        self.assertTrue(tracker.snapshot()['calibrated'])
+        self.assertAlmostEqual(tracker.snapshot()['ear_threshold'], .18)
+
+    def test_csv_includes_calibrated_driver_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.LOG_FILE = str(Path(directory) / 'diagnostics.csv')
+            sample = (0, math.inf, 'Vehicle', 'Dry', 'normal', math.inf, 0, 'MONITOR')
+            snap = dict(face=True, yaw=1, pitch=8, gaze_yaw=2, ear=.20, ear_threshold=.18)
+            self.app.log_scenario(sample, 'LOOK_STRAIGHT', (0, 0, .6), 'LOOK STRAIGHT TO DRIVE', snap)
+            self.app.log_scenario(sample, 'LOOK_STRAIGHT', (0, 0, .8), 'TRACKING LOST STOP', dict(snap, face=False))
+            with Path(self.app.LOG_FILE).open(newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[0]['pitch_deg'], '8')
+            self.assertEqual(rows[0]['ear'], '0.2')
+            self.assertEqual(rows[0]['ear_threshold'], '0.18')
+            self.assertEqual(rows[1]['pitch_deg'], '')
+            self.assertEqual(rows[1]['ear'], '')
+
+    def test_log_distinguishes_forward_gate_from_obstacle_braking(self):
+        self.assertEqual(self.app.control_action('normal', 'LOOK_STRAIGHT_WAIT', (0, 0, .6)),
+                         'LOOK STRAIGHT TO DRIVE')
+        self.assertEqual(self.app.control_action('normal', 'LOOK_STRAIGHT', (0, 0, 1)), 'BRAKE')
+        self.assertEqual(self.app.control_action('drowsy', 'LOOK_STRAIGHT_WAIT', (0, 0, .8)), 'DROWSY STOP')
 
     def test_manual_brake_suppresses_throttle(self):
         sim = self.simulator()

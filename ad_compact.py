@@ -14,6 +14,7 @@ import math
 import os
 import random
 import re
+from statistics import median
 import threading
 import time
 import traceback
@@ -30,10 +31,11 @@ try:
 except ImportError:
     carla = None
 
-LOG_FILE = "adas_log_v2.csv"
+LOG_FILE = "adas_log_v3.csv"
 
 # --- Driver monitoring ---
-EAR_THRESHOLD = 0.21            # eyes "closed" below this
+EAR_THRESHOLD = 0.21            # upper bound for calibrated eye-closure threshold
+EAR_CLOSED_RATIO = 0.60         # fraction of neutral open-eye EAR
 DROWSY_SECONDS = 2.0            # eyes closed this long -> drowsy
 DISTRACT_SECONDS = 2.0          # eyes off road this long -> distracted
 OFF_ROAD_YAW_DEG = 25.0         # head+gaze turned further than this = off road
@@ -49,6 +51,9 @@ HEAD_STEER_FULL = 40.0
 HEAD_MAX_STEER = 0.45
 HEAD_STEER_RATE = 0.6           # maximum steering change per second
 HEAD_THROTTLE_RATE = 0.35
+STRAIGHT_ENTER = (10.0, 12.0, 12.0)  # yaw, pitch, horizontal gaze (degrees)
+STRAIGHT_EXIT = (15.0, 18.0, 18.0)   # wider exit limits prevent boundary flicker
+STRAIGHT_HOLD_S = 0.75               # look forward continuously before resuming
 HEAD_PEDAL_DEADZONE = 12.0       # pitch degrees before throttle/brake responds
 HEAD_PEDAL_FULL = 35.0          # pitch degrees for full pedal input
 
@@ -124,6 +129,49 @@ class FrameWorker(threading.Thread):
         with self._lock:
             return None if self._frame is None else self._frame.copy()
 
+class DriverMonitor:
+    """Separate sustained eye closure from looking away or unreliable head angles."""
+    def __init__(self):
+        self.closed_since = self.away_since = None
+        self.threshold = EAR_THRESHOLD
+
+    def update(self, face, calibrated, yaw, pitch, gaze, ear, neutral_ear, now):
+        self.threshold = min(EAR_THRESHOLD, neutral_ear * EAR_CLOSED_RATIO) if neutral_ear else EAR_THRESHOLD
+        reliable_eyes = face and calibrated and abs(yaw) < 35 and abs(pitch) < 25
+        closed = reliable_eyes and ear is not None and ear < self.threshold
+        away = not face or (calibrated and (
+            abs(yaw + gaze) > OFF_ROAD_YAW_DEG or abs(pitch) > OFF_ROAD_PITCH_DOWN_DEG))
+        self.closed_since = (now if self.closed_since is None else self.closed_since) if closed else None
+        self.away_since = (now if self.away_since is None else self.away_since) if away else None
+        if self.closed_since is not None and now - self.closed_since >= DROWSY_SECONDS:
+            return "drowsy"
+        if self.away_since is not None and now - self.away_since >= DISTRACT_SECONDS:
+            return "distracted"
+        return "normal"
+
+
+class StraightDriveGate:
+    """Require a stable forward pose before allowing CARLA autopilot to move."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.active, self.since = False, None
+
+    def allow(self, snap):
+        values = [snap.get(name, math.nan) for name in ("yaw", "pitch", "gaze_yaw")]
+        limits = STRAIGHT_EXIT if self.active else STRAIGHT_ENTER
+        forward = (snap.get("face") and snap.get("calibrated") and snap.get("state") == "normal"
+                   and all(math.isfinite(v) and abs(v) <= limit for v, limit in zip(values, limits)))
+        if not forward:
+            self.reset()
+            return False
+        now = time.monotonic()
+        self.since = now if self.since is None else self.since
+        self.active = self.active or now - self.since >= STRAIGHT_HOLD_S
+        return self.active
+
+
 class DriverTracker(FrameWorker):
     def __init__(self, camera_index=0):
         super().__init__()
@@ -131,8 +179,7 @@ class DriverTracker(FrameWorker):
         self.error = None
         self._snap = dict(state="unavailable", face=False, yaw=0.0, pitch=0.0,
                           gaze_yaw=0.0, ear=None, calibrated=False)
-        self._closed_since = None
-        self._away_since = None
+        self.monitor = DriverMonitor()
         self._cal = []
         self._neutral = None
         self._updated_at = 0.0
@@ -177,18 +224,18 @@ class DriverTracker(FrameWorker):
                 if not ok:
                     with self._lock:
                         self._snap.update(state="unavailable", face=False, yaw=0.0, pitch=0.0)
-                    self._closed_since = self._away_since = None
+                    self.monitor = DriverMonitor()
                     self._stop_evt.wait(0.02)
                     continue
                 if self._recenter.is_set():
                     self._recenter.clear()
                     self._cal, self._neutral = [], None
-                    self._closed_since = self._away_since = None
+                    self.monitor = DriverMonitor()
                 h, w = raw.shape[:2]
                 res = mesh.process(cv2.cvtColor(raw, cv2.COLOR_BGR2RGB))   # un-mirrored frame
                 now = time.monotonic()
                 if now - self._updated_at > 0.5:
-                    self._closed_since = self._away_since = None
+                    self.monitor = DriverMonitor()
 
                 face, ear, yaw, pitch, gaze_yaw = False, None, 0.0, 0.0, 0.0
                 lm = None
@@ -203,29 +250,17 @@ class DriverTracker(FrameWorker):
                                eye_aspect_ratio(lm, LEFT_EYE, w, h)) / 2.0
 
                         if self._neutral is None:           # auto-calibrate on first frames
-                            self._cal.append((raw_yaw, raw_pitch, gaze_x))
+                            self._cal.append((raw_yaw, raw_pitch, gaze_x, ear))
                             if len(self._cal) >= CALIBRATION_FRAMES:
-                                self._neutral = tuple(np.mean(self._cal, axis=0))
+                                self._neutral = tuple(median(values) for values in zip(*self._cal))
                         n = self._neutral
                         if n is not None:
                             yaw, pitch = raw_yaw - n[0], raw_pitch - n[1]
                             gaze_yaw = (gaze_x - n[2]) * GAZE_DEG_PER_UNIT
 
                 calibrated = self._neutral is not None
-                # EAR is unreliable when the head is turned far, so ignore it then
-                closed = face and ear < EAR_THRESHOLD and abs(yaw) < 40
-                off_road = (not face) or (calibrated and (
-                    abs(yaw + gaze_yaw) > OFF_ROAD_YAW_DEG or pitch < -OFF_ROAD_PITCH_DOWN_DEG))
-
-                self._closed_since = (self._closed_since or now) if closed else None
-                self._away_since = (self._away_since or now) if off_road else None
-
-                if self._closed_since and now - self._closed_since >= DROWSY_SECONDS:
-                    state = "drowsy"
-                elif self._away_since and now - self._away_since >= DISTRACT_SECONDS:
-                    state = "distracted"
-                else:
-                    state = "normal"
+                state = self.monitor.update(face, calibrated, yaw, pitch, gaze_yaw, ear,
+                                            self._neutral[3] if calibrated else None, now)
 
                 # mirrored preview with overlay
                 disp = cv2.flip(raw, 1)
@@ -245,7 +280,7 @@ class DriverTracker(FrameWorker):
 
                 with self._lock:
                     self._snap = dict(state=state, face=face, yaw=yaw, pitch=pitch,
-                                      gaze_yaw=gaze_yaw, ear=ear, calibrated=calibrated)
+                                      gaze_yaw=gaze_yaw, ear=ear, ear_threshold=self.monitor.threshold, calibrated=calibrated)
                     self._frame = disp
                     self._updated_at = time.monotonic()
 
@@ -314,11 +349,12 @@ def control_action(state, mode, controls):
     if controls is None:
         return "AUTOPILOT"
     if controls[2] > 0:
-        return {"drowsy": "DROWSY STOP", "unavailable": "TRACKING LOST STOP"}.get(state, "BRAKE")
+        return {"drowsy": "DROWSY STOP", "unavailable": "TRACKING LOST STOP"}.get(
+            state, "LOOK STRAIGHT TO DRIVE" if mode == "LOOK_STRAIGHT_WAIT" else "BRAKE")
     return "DRIVER ALERT" if state == "distracted" else "DRIVE"
 
 
-def log_scenario(sample, mode, controls, action):
+def log_scenario(sample, mode, controls, action, snap=None):
     """Log commanded controls, not measured actuator response."""
     speed, distance, obstacle, road, state, ttc, risk, decision = sample
     new = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
@@ -327,12 +363,15 @@ def log_scenario(sample, mode, controls, action):
         if new:
             writer.writerow(["time", "speed_kmh", "distance_m", "obstacle", "road",
                              "driver_state", "ttc_s", "risk", "risk_decision", "mode",
-                             "control_action", "commanded_throttle", "commanded_steer", "commanded_brake"])
+                             "control_action", "commanded_throttle", "commanded_steer", "commanded_brake",
+                             "yaw_deg", "pitch_deg", "gaze_yaw_deg", "ear", "ear_threshold"])
         writer.writerow([datetime.now().isoformat(timespec="milliseconds"), round(speed, 1),
                          round(distance, 1) if math.isfinite(distance) else "NO_LEAD_IN_RANGE",
                          obstacle if math.isfinite(distance) else "None detected", road, state, round(ttc, 2) if math.isfinite(ttc) else "N/A",
                          risk, decision, mode, action,
-                         *(tuple(round(v, 3) for v in controls) if controls is not None else ("", "", ""))])
+                         *(tuple(round(v, 3) for v in controls) if controls is not None else ("", "", "")),
+                         *((snap or {}).get(name, "") if (snap or {}).get("face") else ""
+                           for name in ("yaw", "pitch", "gaze_yaw", "ear", "ear_threshold"))])
 
 def listen_once():
     r = sr.Recognizer()
@@ -569,6 +608,8 @@ class ADASApp(wx.Frame):
                 print(f"YOLO disabled: {e}")
 
         self.head_controller = HeadController()
+        self.straight_gate = StraightDriveGate()
+        self._driver_snap = None
         self._evaluation = None
         self._last_log = 0.0
         self._last_beep = 0.0
@@ -599,6 +640,7 @@ class ADASApp(wx.Frame):
         connected = self.carla_sim.vehicle is not None
         for name, text, value, handler in [
             ("auto_chk", "Use live CARLA speed + lead distance", connected, lambda e: self._apply_auto_state()),
+            ("straight_chk", "Drive only while looking straight (autopilot steers)", False, self.on_straight_toggle),
             ("head_control_chk", "Drive with head movement (enable after calibration)", False, self.on_head_control_toggle),
             ("autopilot_chk", "CARLA autopilot", False, self.on_autopilot_toggle),
         ]:
@@ -607,6 +649,7 @@ class ADASApp(wx.Frame):
             widget.Enable(connected)
             widget.Bind(wx.EVT_CHECKBOX, handler)
             setattr(self, name, widget)
+        label("Look-straight mode: face forward to drive; look away to stop.")
         label("Head: yaw steers; look up to accelerate, down to brake. Keyboard: WASD/arrows.")
         self.command_input = add(wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER))
         self.command_input.SetHint("Set speed at 80 and distance 20")
@@ -651,14 +694,26 @@ class ADASApp(wx.Frame):
         self.head_controller.reset()
         enabled = self.autopilot_chk.GetValue()
         if enabled:
+            self.straight_chk.SetValue(False)
+            self.straight_gate.reset()
             self.head_control_chk.SetValue(False)
         self.carla_sim.set_autopilot(enabled)
 
     def on_head_control_toggle(self, _event):
         self.head_controller.reset()
         if self.head_control_chk.GetValue():
+            self.straight_chk.SetValue(False)
+            self.straight_gate.reset()
             self.autopilot_chk.SetValue(False)
             self.carla_sim.set_autopilot(False)
+
+    def on_straight_toggle(self, _event):
+        self.straight_gate.reset()
+        self.head_controller.reset()
+        if self.straight_chk.GetValue():
+            self.head_control_chk.SetValue(False)
+            self.autopilot_chk.SetValue(False)
+        self.carla_sim.set_autopilot(False)
 
     @staticmethod
     def _key_down(vk_code):
@@ -706,13 +761,18 @@ class ADASApp(wx.Frame):
         else:
             snap = self.tracker.snapshot()
         state = snap["state"]
+        self._driver_snap = snap
 
         self.carla_sim.update_view()
 
         decision = self.evaluate(state)
 
         adas_brake = brake_level(decision, state, self._is_auto())
-        if self.autopilot_chk.GetValue():
+        if self.straight_chk.GetValue():
+            allowed = self.straight_gate.allow(snap)
+            mode = "LOOK_STRAIGHT" if allowed else "LOOK_STRAIGHT_WAIT"
+            controls = self.carla_sim.set_brake(adas_brake if allowed else max(0.6, adas_brake))
+        elif self.autopilot_chk.GetValue():
             mode = "AUTOPILOT"
             controls = self.carla_sim.set_brake(adas_brake)
         else:
@@ -785,11 +845,12 @@ class ADASApp(wx.Frame):
         key = state, decision, mode, action
         now = time.monotonic()
         if force or key != self._last_key or now - self._last_log >= 1.0:
-            log_scenario(self._evaluation, mode, controls, action)
+            log_scenario(self._evaluation, mode, controls, action, self._driver_snap)
             self._last_key, self._last_log = key, now
 
     def on_evaluate(self, _event):
-        if self.evaluate(self.tracker.snapshot()["state"], force_log=True) is None:
+        self._driver_snap = self.tracker.snapshot()
+        if self.evaluate(self._driver_snap["state"], force_log=True) is None:
             wx.MessageBox("Enter finite numbers: speed >= 0, distance > 0", "Input Error")
 
     def on_command(self, _event):
