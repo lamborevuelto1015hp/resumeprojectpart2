@@ -85,3 +85,39 @@ these heuristics still need checking against your camera and face.
 `adas_log_v3.csv` also records yaw, pitch, horizontal gaze, EAR, and the calibrated
 EAR threshold. These fields help investigate false drowsiness reports. Earlier
 CSV files keep their original format.
+
+## CARLA connection timeout (Windows)
+
+Start CARLA first and wait until the town is visible. For a CARLA UE4 installation,
+run from the simulator folder:
+
+```powershell
+.\CarlaUE4.exe -carla-rpc-port=2000
+```
+
+In a separate PowerShell terminal, check that its RPC port is reachable:
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 2000
+```
+
+If `TcpTestSucceeded` is false, check the running simulator's address/port and
+server startup output. Increasing Python timeouts cannot make a missing server
+listen. If CARLA is on another computer, use that computer's address instead of
+`127.0.0.1`. An open TCP port alone does not prove that CARLA is ready.
+
+The app now allows 10 seconds per RPC and retries connection for up to 60 seconds.
+For a slow simulator, set longer values in the same terminal used to run the app:
+
+```powershell
+$env:CARLA_HOST = "127.0.0.1"
+$env:CARLA_PORT = "2000"
+$env:CARLA_CONNECT_TIMEOUT = "90"
+$env:CARLA_RPC_TIMEOUT = "20"
+python ad_compact.py
+```
+
+Both timeout values must be finite positive seconds. RPC timeout also applies to
+subsequent simulator calls; larger values may delay the GUI when CARLA is stuck.
+If the port is reachable but RPC calls still time out, verify the simulator is
+responsive and the installed CARLA Python client matches the simulator release.

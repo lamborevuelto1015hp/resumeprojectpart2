@@ -397,21 +397,31 @@ def parse_command(text):
                 out[field] = word.capitalize()
     return out
 
-def connect_carla(host, port, timeout=45.0):
-    """Contact the configured server directly, with a bounded retry period."""
+def connect_carla(host, port, timeout=60.0, rpc_timeout=10.0):
+    """Allow a slow server to respond, with a bounded total connection period."""
+    if not all(math.isfinite(value) and value > 0 for value in (timeout, rpc_timeout)):
+        raise ValueError("CARLA_CONNECT_TIMEOUT and CARLA_RPC_TIMEOUT must be finite positive seconds")
     client = carla.Client(host, port)
     deadline = time.monotonic() + timeout
     last_error = None
     while time.monotonic() < deadline:
         try:
-            client.set_timeout(max(0.01, min(2.0, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client.set_timeout(min(rpc_timeout, remaining))
             world = client.get_world()
-            client.set_timeout(2.0)
+            client.set_timeout(rpc_timeout)
             return client, world
         except RuntimeError as error:
             last_error = error
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-    raise RuntimeError(f"CARLA unavailable at {host}:{port}: {last_error}")
+    raise RuntimeError(
+        f"CARLA unavailable at {host}:{port} after {timeout:g}s "
+        f"(RPC timeout {rpc_timeout:g}s). Last error: {last_error}. "
+        "Start the simulator and wait for the town to load; check its RPC port, "
+        "and use matching CARLA Python client/server versions. "
+        "Increase CARLA_RPC_TIMEOUT for a slow simulator.")
 
 class CarlaIntegration:
     def __init__(self):
@@ -431,7 +441,9 @@ class CarlaIntegration:
         try:
             host = os.environ.get("CARLA_HOST", "127.0.0.1")
             port = int(os.environ.get("CARLA_PORT", "2000"))
-            self.client, self.world = connect_carla(host, port)
+            self.client, self.world = connect_carla(
+                host, port, timeout=float(os.environ.get("CARLA_CONNECT_TIMEOUT", "60")),
+                rpc_timeout=float(os.environ.get("CARLA_RPC_TIMEOUT", "10")))
             self.spectator = self.world.get_spectator()
             bp_lib = self.world.get_blueprint_library()
 

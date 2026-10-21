@@ -133,6 +133,53 @@ class CompactTests(unittest.TestCase):
                 self.app.connect_carla('192.0.2.1', 2000, timeout=1)
         self.assertEqual(clock.now, 1)
 
+    def test_slow_carla_gets_longer_rpc_budget(self):
+        client, world = Mock(), Mock()
+        budget = NS(seconds=0)
+        client.set_timeout.side_effect = lambda seconds: setattr(budget, 'seconds', seconds)
+        def get_world():
+            if budget.seconds < 5:
+                raise RuntimeError('needs at least five seconds')
+            return world
+        client.get_world.side_effect = get_world
+        self.app.carla.Client.return_value = client
+        self.assertEqual(self.app.connect_carla('127.0.0.1', 2000), (client, world))
+        self.assertEqual(budget.seconds, 10)
+        client.get_world.assert_called_once()
+
+    def test_rpc_budget_never_exceeds_remaining_connection_time(self):
+        client = Mock()
+        clock = NS(now=0.0, budget=0)
+        client.set_timeout.side_effect = lambda seconds: setattr(clock, 'budget', seconds)
+        def timeout():
+            clock.now += clock.budget
+            raise RuntimeError('timed out')
+        client.get_world.side_effect = timeout
+        self.app.carla.Client.return_value = client
+        fake_time = NS(monotonic=lambda: clock.now,
+                       sleep=lambda seconds: setattr(clock, 'now', clock.now + seconds))
+        with patch.object(self.app, 'time', fake_time):
+            with self.assertRaisesRegex(RuntimeError, 'RPC timeout 10s'):
+                self.app.connect_carla('127.0.0.1', 2000, timeout=3, rpc_timeout=10)
+        self.assertEqual(clock.now, 3)
+        client.set_timeout.assert_called_once_with(3)
+
+    def test_invalid_carla_timeout_configuration(self):
+        for total, rpc in [(0, 10), (-1, 10), (60, 0), (60, math.inf), (math.nan, 10)]:
+            with self.assertRaises(ValueError):
+                self.app.connect_carla('127.0.0.1', 2000, timeout=total, rpc_timeout=rpc)
+        self.app.carla.Client.assert_not_called()
+
+    def test_carla_timeout_environment_configuration(self):
+        environment = dict(CARLA_HOST='127.0.0.1', CARLA_PORT='2000',
+                           CARLA_CONNECT_TIMEOUT='90', CARLA_RPC_TIMEOUT='20')
+        with patch.dict(self.app.os.environ, environment), \
+                patch.object(self.app, 'connect_carla', side_effect=RuntimeError('test unavailable')) as connect, \
+                patch('builtins.print'):
+            sim = self.app.CarlaIntegration()
+        connect.assert_called_once_with('127.0.0.1', 2000, timeout=90, rpc_timeout=20)
+        self.assertIsNone(sim.vehicle)
+
     def test_commands(self):
         self.assertEqual(self.app.parse_command('Set speed at 80 and distance 20 on wet road'),
                          dict(speed='80', distance='20', road='Wet'))
